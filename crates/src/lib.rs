@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     collections::BTreeSet,
+    str::FromStr,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -3347,6 +3348,46 @@ impl<'a> TransactionBuilder<'a> {
         self
     }
 
+    /// Call proxy program arb_perp instruction (spread capture)
+    pub fn proxy_spread_capture(
+        mut self,
+        market_index: u16,
+        taker_stats: &UserStats,
+        makers: &[User],
+    ) -> Self {
+        // 1) main accounts (match ArbPerp<'info>)
+        let mut accounts = build_accounts_proxy(ArbPerpAccounts {
+            state: *state_account(),
+            user: self.sub_account,
+            user_stats: Wallet::derive_stats_account(&self.owner()),
+            authority: self.authority,
+            drift_program: constants::PROGRAM_ID,
+        });
+
+        // 2) remaining accounts (manual collection, no build_accounts)
+        let remaining_accounts = build_remaining_accounts_for_proxy(
+            self.program_data,
+            self.account_data.as_ref(),
+            taker_stats,
+            makers,
+            std::iter::empty(),
+            std::iter::once(&MarketId::perp(market_index)),
+        );
+        accounts.extend(remaining_accounts);
+
+        // 3) proxy instruction (hardcoded program id)
+        let proxy_program_id = Pubkey::from_str("Ecx5sm34EyesW26hiYT8KYnZJT5E79Arm6RHXX2e5c4x")
+            .expect("valid proxy program id");
+        let ix = Instruction {
+            program_id: proxy_program_id,
+            accounts,
+            data: InstructionData::data(&ProxyArbPerpIx { market_index }),
+        };
+
+        self.ixs.push(ix);
+        self
+    }
+
     /// Trigger a conditional order (stop loss, take profit, etc.)
     ///
     /// This instruction allows a filler to trigger a conditional order when the specified
@@ -4262,6 +4303,128 @@ pub fn build_accounts<'a>(
     let mut account_metas = base_accounts.to_account_metas();
     account_metas.extend(accounts.into_iter().map(Into::into));
     account_metas
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArbPerpAccounts {
+    pub state: Pubkey,
+    pub user: Pubkey,
+    pub user_stats: Pubkey,
+    pub authority: Pubkey,
+    pub drift_program: Pubkey,
+}
+
+pub fn build_accounts_proxy(accounts: ArbPerpAccounts) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(accounts.state, false),
+        AccountMeta::new(accounts.user, false),       // user (mut, non-signer)
+        AccountMeta::new(accounts.user_stats, false), // user_stats (mut, non-signer)
+        AccountMeta::new_readonly(accounts.authority, true),
+        AccountMeta::new_readonly(accounts.drift_program, false),
+    ]
+}
+
+/// Build remaining accounts for proxy arb_perp without using build_accounts.
+pub fn build_remaining_accounts_for_proxy<'a>(
+    program_data: &ProgramData,
+    taker_account: &User,
+    taker_stats: &UserStats,
+    makers: &'a [User],
+    markets_readable: impl Iterator<Item = &'a MarketId>,
+    markets_writable: impl Iterator<Item = &'a MarketId>,
+) -> Vec<AccountMeta> {
+    // Order must match drift optional_accounts parsing; use ordered set to dedupe.
+    let mut accounts = BTreeSet::<RemainingAccount>::new();
+
+    let mut include_market =
+        |market_index: u16, market_type: MarketType, writable: bool| match market_type {
+            MarketType::Spot => {
+                let SpotMarket { pubkey, oracle, .. } = program_data
+                    .spot_market_config_by_index(market_index)
+                    .expect("exists");
+                accounts.extend(
+                    [
+                        RemainingAccount::Spot {
+                            pubkey: *pubkey,
+                            writable,
+                        },
+                        RemainingAccount::Oracle { pubkey: *oracle },
+                    ]
+                    .iter(),
+                )
+            }
+            MarketType::Perp => {
+                let PerpMarket { pubkey, amm, .. } = program_data
+                    .perp_market_config_by_index(market_index)
+                    .expect("exists");
+                accounts.extend(
+                    [
+                        RemainingAccount::Perp {
+                            pubkey: *pubkey,
+                            writable,
+                        },
+                        RemainingAccount::Oracle { pubkey: amm.oracle },
+                    ]
+                    .iter(),
+                )
+            }
+        };
+
+    for market in markets_writable {
+        include_market(market.index(), market.kind(), true);
+    }
+
+    for market in markets_readable {
+        include_market(market.index(), market.kind(), false);
+    }
+
+    for user in makers.iter().chain(std::iter::once(taker_account)) {
+        // include all open positions as readable
+        for p in user.spot_positions.iter().filter(|p| !p.is_available()) {
+            include_market(p.market_index, MarketType::Spot, false);
+        }
+        for p in user.perp_positions.iter().filter(|p| !p.is_available()) {
+            include_market(p.market_index, MarketType::Perp, false);
+        }
+        // always include quote spot
+        include_market(MarketId::QUOTE_SPOT.index(), MarketType::Spot, false);
+    }
+
+    let mut rem: Vec<AccountMeta> = accounts.into_iter().map(Into::into).collect();
+
+    // maker user + stats (user -> stats)
+    let mut seen_pairs = std::collections::HashSet::<(Pubkey, Pubkey)>::new();
+    for maker in makers {
+        let maker_user = Wallet::derive_user_account(&maker.authority, maker.sub_account_id);
+        let maker_stats = Wallet::derive_stats_account(&maker.authority);
+        if seen_pairs.insert((maker_user, maker_stats)) {
+            rem.push(AccountMeta::new(maker_user, false));
+            rem.push(AccountMeta::new(maker_stats, false));
+        }
+    }
+
+    if taker_stats.is_referred() {
+        rem.push(AccountMeta::new(
+            Wallet::derive_user_account(&taker_stats.referrer, 0),
+            false,
+        ));
+        rem.push(AccountMeta::new(
+            Wallet::derive_stats_account(&taker_stats.referrer),
+            false,
+        ));
+    }
+
+    rem
+}
+
+#[derive(AnchorSerialize)]
+struct ProxyArbPerpIx {
+    market_index: u16,
+}
+
+impl Discriminator for ProxyArbPerpIx {
+    // anchor discriminator for "global:arb_perp"
+    const DISCRIMINATOR: [u8; 8] = [116, 105, 138, 99, 28, 171, 39, 225];
 }
 
 #[cfg(test)]
