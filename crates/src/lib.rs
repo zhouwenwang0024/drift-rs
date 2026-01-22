@@ -4417,6 +4417,7 @@ pub fn build_remaining_accounts_for_proxy<'a>(
         ));
     }
 
+    // Keep revenue share escrow as the final remaining account (Swift-only behavior).
     if let Some(authority) = revenue_share_authority {
         rem.push(AccountMeta::new(
             derive_revenue_share_escrow(&authority),
