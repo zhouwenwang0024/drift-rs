@@ -3380,10 +3380,13 @@ impl<'a> TransactionBuilder<'a> {
         // 3) proxy instruction (hardcoded program id)
         let proxy_program_id = Pubkey::from_str("Ecx5sm34EyesW26hiYT8KYnZJT5E79Arm6RHXX2e5c4x")
             .expect("valid proxy program id");
+        let mut data = Vec::with_capacity(10);
+        data.extend_from_slice(&PROXY_ARB_PERP_DISCRIMINATOR);
+        data.extend_from_slice(&market_index.to_le_bytes());
         let ix = Instruction {
             program_id: proxy_program_id,
             accounts,
-            data: InstructionData::data(&ProxyArbPerpIx { market_index }),
+            data,
         };
 
         self.ixs.push(ix);
@@ -4428,15 +4431,8 @@ pub fn build_remaining_accounts_for_proxy<'a>(
     rem
 }
 
-#[derive(AnchorSerialize)]
-struct ProxyArbPerpIx {
-    market_index: u16,
-}
-
-impl Discriminator for ProxyArbPerpIx {
-    // anchor discriminator for "global:arb_perp"
-    const DISCRIMINATOR: [u8; 8] = [116, 105, 138, 99, 28, 171, 39, 225];
-}
+// anchor discriminator for "global:arb_perp"
+const PROXY_ARB_PERP_DISCRIMINATOR: [u8; 8] = [116, 105, 138, 99, 28, 171, 39, 225];
 
 #[cfg(test)]
 mod tests {
