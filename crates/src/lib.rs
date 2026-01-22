@@ -3354,6 +3354,7 @@ impl<'a> TransactionBuilder<'a> {
         market_index: u16,
         taker_stats: &UserStats,
         makers: &[User],
+        revenue_share_authority: Option<Pubkey>,
     ) -> Self {
         // 1) main accounts (match ArbPerp<'info>)
         let mut accounts = build_accounts_proxy(ArbPerpAccounts {
@@ -3372,6 +3373,7 @@ impl<'a> TransactionBuilder<'a> {
             makers,
             std::iter::empty(),
             std::iter::once(&MarketId::perp(market_index)),
+            revenue_share_authority,
         );
         accounts.extend(remaining_accounts);
 
@@ -4332,6 +4334,7 @@ pub fn build_remaining_accounts_for_proxy<'a>(
     makers: &'a [User],
     markets_readable: impl Iterator<Item = &'a MarketId>,
     markets_writable: impl Iterator<Item = &'a MarketId>,
+    revenue_share_authority: Option<Pubkey>,
 ) -> Vec<AccountMeta> {
     // Order must match drift optional_accounts parsing; use ordered set to dedupe.
     let mut accounts = BTreeSet::<RemainingAccount>::new();
@@ -4410,6 +4413,13 @@ pub fn build_remaining_accounts_for_proxy<'a>(
         ));
         rem.push(AccountMeta::new(
             Wallet::derive_stats_account(&taker_stats.referrer),
+            false,
+        ));
+    }
+
+    if let Some(authority) = revenue_share_authority {
+        rem.push(AccountMeta::new(
+            derive_revenue_share_escrow(&authority),
             false,
         ));
     }
