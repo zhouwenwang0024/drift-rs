@@ -619,6 +619,84 @@ impl DLOB {
         })
     }
 
+    pub fn find_crossing_region_all_types(
+        &self,
+        oracle_price: u64,
+        market_index: u16,
+        market_type: MarketType,
+        perp_market: Option<&PerpMarket>,
+        trigger_price: u64,
+        depth: usize,
+    ) -> Option<CrossingRegionAll> {
+        let book = self.get_l3_snapshot(market_index, market_type);
+
+        let mut bids = book
+            .bids(Some(oracle_price), perp_market, Some(trigger_price))
+            .peekable();
+        let mut asks = book
+            .asks(Some(oracle_price), perp_market, Some(trigger_price))
+            .peekable();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let effective_price = |order: &L3Order, is_bid: bool| -> u64 {
+            if let Some(market) = perp_market {
+                if let Some(price) = order.post_trigger_price(book.slot, oracle_price, market) {
+                    return price;
+                }
+                if order.price == 0 {
+                    let dir = if is_bid {
+                        Direction::Long
+                    } else {
+                        Direction::Short
+                    };
+                    if let Ok(vamm_price) = market.fallback_price(
+                        dir,
+                        oracle_price as i64,
+                        order.max_ts.saturating_sub(now) as i64,
+                    ) {
+                        return vamm_price;
+                    }
+                }
+            }
+            order.price
+        };
+
+        let best_bid = bids.peek()?.clone();
+        let best_ask = asks.peek()?.clone();
+        let best_bid_price = effective_price(&best_bid, true);
+        let best_ask_price = effective_price(&best_ask, false);
+
+        if best_bid_price < best_ask_price {
+            return None;
+        }
+
+        let crossing_bids: Vec<L3Order> = bids
+            .take(depth)
+            .take_while(|b| effective_price(b, true) >= best_ask_price)
+            .cloned()
+            .collect();
+        let crossing_asks: Vec<L3Order> = asks
+            .take(depth)
+            .take_while(|a| effective_price(a, false) <= best_bid_price)
+            .cloned()
+            .collect();
+
+        if crossing_asks.is_empty() || crossing_bids.is_empty() {
+            return None;
+        }
+
+        Some(CrossingRegionAll {
+            slot: book.slot,
+            best_bid,
+            best_ask,
+            crossing_bids,
+            crossing_asks,
+        })
+    }
+
     fn remove_order(&self, user: &Pubkey, slot: u64, order: Order) {
         let order_id = order_hash(user, order.order_id);
 

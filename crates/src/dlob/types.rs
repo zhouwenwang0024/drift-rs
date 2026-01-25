@@ -701,6 +701,15 @@ pub struct CrossingRegion {
     pub crossing_asks: Vec<L3Order>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct CrossingRegionAll {
+    pub slot: u64,
+    pub best_bid: L3Order,
+    pub best_ask: L3Order,
+    pub crossing_bids: Vec<L3Order>,
+    pub crossing_asks: Vec<L3Order>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct L3Order {
     /// point in time limit price of the order at some slot & oracle price
