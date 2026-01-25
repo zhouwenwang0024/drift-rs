@@ -4030,6 +4030,39 @@ impl<'a> TransactionBuilder<'a> {
         self
     }
 
+    /// Update AMM state for the given perp market indexes.
+    ///
+    /// Appends a Drift `UpdateAmms` instruction to the transaction.
+    pub fn update_amms(mut self, market_indexes: Vec<u16>) -> Self {
+        if market_indexes.is_empty() {
+            return self;
+        }
+
+        let mut accounts = types::accounts::UpdateAmms {
+            state: *state_account(),
+            authority: self.authority,
+        }
+        .to_account_metas();
+
+        for market_index in market_indexes.iter().copied() {
+            let market = self
+                .program_data
+                .perp_market_config_by_index(market_index)
+                .expect("perp markets syncd");
+            accounts.push(AccountMeta::new_readonly(market.amm.oracle, false));
+            accounts.push(AccountMeta::new(market.pubkey, false));
+        }
+
+        let ix = Instruction {
+            program_id: PROGRAM_ID,
+            accounts,
+            data: InstructionData::data(&drift_idl::instructions::UpdateAmms { market_indexes }),
+        };
+
+        self.ixs.push(ix);
+        self
+    }
+
     pub fn disable_user_hlm(
         mut self,
         user: Pubkey,

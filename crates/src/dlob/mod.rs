@@ -641,9 +641,10 @@ impl DLOB {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let auction_slot = book.slot.saturating_add(1);
         let effective_price = |order: &L3Order, is_bid: bool| -> u64 {
             if let Some(market) = perp_market {
-                if let Some(price) = order.post_trigger_price(book.slot, oracle_price, market) {
+                if let Some(price) = order.post_trigger_price(auction_slot, oracle_price, market) {
                     return price;
                 }
                 if order.price == 0 {
@@ -690,8 +691,8 @@ impl DLOB {
 
         Some(CrossingRegionAll {
             slot: book.slot,
-            best_bid,
-            best_ask,
+            best_bid: best_bid.clone(),
+            best_ask: best_ask.clone(),
             crossing_bids,
             crossing_asks,
         })
@@ -1249,7 +1250,7 @@ impl L3Book {
             .unwrap()
             .as_secs();
 
-        let slot = self.slot;
+        let auction_slot = self.slot.saturating_add(1);
         let oracle_price_for_vamm = oracle_price.unwrap_or(self.oracle_price) as i64;
 
         // Skip non-triggering trigger orders
@@ -1300,7 +1301,7 @@ impl L3Book {
                         || (!x.is_trigger_above() && trig_price < x.price);
                     if would_trigger {
                         if let Some(post_trigger_price) =
-                            x.post_trigger_price(slot, oracle_price_for_vamm as u64, market)
+                            x.post_trigger_price(auction_slot, oracle_price_for_vamm as u64, market)
                         {
                             if post_trigger_price > best_price {
                                 best_price = post_trigger_price;
@@ -1397,7 +1398,7 @@ impl L3Book {
             }
         }
 
-        let slot = self.slot;
+        let auction_slot = self.slot.saturating_add(1);
         let oracle_price_for_vamm = oracle_price.unwrap_or(self.oracle_price) as i64;
 
         enum Src {
@@ -1436,7 +1437,7 @@ impl L3Book {
                         || (!x.is_trigger_above() && trig_price < x.price);
                     if would_trigger {
                         if let Some(post_trigger_price) =
-                            x.post_trigger_price(slot, oracle_price_for_vamm as u64, market)
+                            x.post_trigger_price(auction_slot, oracle_price_for_vamm as u64, market)
                         {
                             if post_trigger_price < best_price {
                                 best_src = Some(Src::Trigger);
@@ -1513,6 +1514,7 @@ impl L3Book {
         self.slot = orderbook.last_modified_slot;
         self.oracle_price = oracle_price;
         let market_tick_size = orderbook.market_tick_size;
+        let auction_slot = self.slot.saturating_add(1);
 
         // Debug counters: track orders with missing metadata
         let mut missing_metadata_count = 0u32;
@@ -1613,7 +1615,7 @@ impl L3Book {
             total_orders_count += 1;
             if let Some(meta) = metadata.get(&order.id) {
                 let price = order
-                    .get_price(self.slot, oracle_price, market_tick_size)
+                    .get_price(auction_slot, oracle_price, market_tick_size)
                     .unwrap_or_default();
                 let order = L3Order {
                     price,
@@ -1640,7 +1642,7 @@ impl L3Book {
             total_orders_count += 1;
             if let Some(meta) = metadata.get(&order.id) {
                 let price = order
-                    .get_price(self.slot, oracle_price, market_tick_size)
+                    .get_price(auction_slot, oracle_price, market_tick_size)
                     .unwrap_or_default();
                 let order = L3Order {
                     price,
@@ -1710,7 +1712,7 @@ impl L3Book {
             total_orders_count += 1;
             if let Some(meta) = metadata.get(&order.id) {
                 let price = order
-                    .get_price(self.slot, oracle_price, market_tick_size)
+                    .get_price(auction_slot, oracle_price, market_tick_size)
                     .unwrap_or_default();
                 let order = L3Order {
                     price,
@@ -1737,7 +1739,7 @@ impl L3Book {
             total_orders_count += 1;
             if let Some(meta) = metadata.get(&order.id) {
                 let price = order
-                    .get_price(self.slot, oracle_price, market_tick_size)
+                    .get_price(auction_slot, oracle_price, market_tick_size)
                     .unwrap_or_default();
                 let order = L3Order {
                     price,
@@ -1892,6 +1894,7 @@ impl L2Book {
         self.slot = orderbook.last_modified_slot;
         self.oracle_price = oracle_price;
         let market_tick_size = orderbook.market_tick_size;
+        let auction_slot = self.slot.saturating_add(1);
 
         // Process resting limit orders (fixed price orders)
         for order in orderbook.resting_limit_orders.bids.values() {
@@ -1942,7 +1945,7 @@ impl L2Book {
         // Process market orders as taker orders
         for order in orderbook.market_orders.bids.values() {
             if order.size > 0 {
-                if let Some(price) = order.get_price(self.slot, oracle_price, market_tick_size) {
+                if let Some(price) = order.get_price(auction_slot, oracle_price, market_tick_size) {
                     let size = self.bids.entry(price).or_insert(0);
                     *size = size.saturating_add(order.size);
                 } else {
@@ -1952,7 +1955,7 @@ impl L2Book {
         }
         for order in orderbook.market_orders.asks.values() {
             if order.size > 0 {
-                if let Some(price) = order.get_price(self.slot, oracle_price, market_tick_size) {
+                if let Some(price) = order.get_price(auction_slot, oracle_price, market_tick_size) {
                     let size = self.asks.entry(price).or_insert(0);
                     *size = size.saturating_add(order.size);
                 } else {
@@ -1964,7 +1967,7 @@ impl L2Book {
         // Process oracle orders as taker orders
         for order in orderbook.oracle_orders.bids.values() {
             if order.size > 0 {
-                if let Some(price) = order.get_price(self.slot, oracle_price, market_tick_size) {
+                if let Some(price) = order.get_price(auction_slot, oracle_price, market_tick_size) {
                     let size = self.bids.entry(price).or_insert(0);
                     *size = size.saturating_add(order.size);
                 } else {
@@ -1974,7 +1977,7 @@ impl L2Book {
         }
         for order in orderbook.oracle_orders.asks.values() {
             if order.size > 0 {
-                if let Some(price) = order.get_price(self.slot, oracle_price, market_tick_size) {
+                if let Some(price) = order.get_price(auction_slot, oracle_price, market_tick_size) {
                     let size = self.asks.entry(price).or_insert(0);
                     *size = size.saturating_add(order.size);
                 } else {
