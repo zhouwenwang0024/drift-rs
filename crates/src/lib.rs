@@ -4063,6 +4063,59 @@ impl<'a> TransactionBuilder<'a> {
         self
     }
 
+    /// Call proxy program jit instruction
+    pub fn proxy_jit(
+        mut self,
+        market_index: u16,
+        reference_price: i64,
+        edge_ppm: i64,
+        taker_stats: &UserStats,
+        makers: &[User],
+        proxy_program_id: Option<Pubkey>,
+    ) -> Self {
+        // 1) main accounts (match Jit<'info>)
+        let mut accounts = build_accounts_proxy_jit(JitAccounts {
+            state: *state_account(),
+            user: self.sub_account,
+            user_stats: Wallet::derive_stats_account(&self.owner()),
+            taker: self.sub_account,
+            taker_stats: Wallet::derive_stats_account(&self.owner()),
+            authority: self.authority,
+            drift_program: constants::PROGRAM_ID,
+        });
+
+        // 2) remaining accounts (manual collection, no build_accounts)
+        let remaining_accounts = build_remaining_accounts_for_proxy(
+            self.program_data,
+            self.account_data.as_ref(),
+            taker_stats,
+            makers,
+            std::iter::empty(),
+            std::iter::once(&MarketId::perp(market_index)),
+            None,
+        );
+        accounts.extend(remaining_accounts);
+
+        // 3) proxy instruction
+        let proxy_program_id = proxy_program_id.unwrap_or_else(|| {
+            Pubkey::from_str("Ecx5sm34EyesW26hiYT8KYnZJT5E79Arm6RHXX2e5c4x")
+                .expect("valid proxy program id")
+        });
+        let mut data = Vec::with_capacity(26);
+        data.extend_from_slice(&PROXY_JIT_DISCRIMINATOR);
+        data.extend_from_slice(&market_index.to_le_bytes());
+        data.extend_from_slice(&reference_price.to_le_bytes());
+        data.extend_from_slice(&edge_ppm.to_le_bytes());
+        let ix = Instruction {
+            program_id: proxy_program_id,
+            accounts,
+            data,
+        };
+
+        self.ixs.push(ix);
+        self
+    }
+
     pub fn disable_user_hlm(
         mut self,
         user: Pubkey,
@@ -4352,11 +4405,34 @@ pub struct ArbPerpAccounts {
     pub drift_program: Pubkey,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct JitAccounts {
+    pub state: Pubkey,
+    pub user: Pubkey,
+    pub user_stats: Pubkey,
+    pub taker: Pubkey,
+    pub taker_stats: Pubkey,
+    pub authority: Pubkey,
+    pub drift_program: Pubkey,
+}
+
 pub fn build_accounts_proxy(accounts: ArbPerpAccounts) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new_readonly(accounts.state, false),
         AccountMeta::new(accounts.user, false),       // user (mut, non-signer)
         AccountMeta::new(accounts.user_stats, false), // user_stats (mut, non-signer)
+        AccountMeta::new_readonly(accounts.authority, true),
+        AccountMeta::new_readonly(accounts.drift_program, false),
+    ]
+}
+
+pub fn build_accounts_proxy_jit(accounts: JitAccounts) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(accounts.state, false),
+        AccountMeta::new(accounts.user, false),       // user (mut, non-signer)
+        AccountMeta::new(accounts.user_stats, false), // user_stats (mut, non-signer)
+        AccountMeta::new(accounts.taker, false),      // taker (mut, non-signer)
+        AccountMeta::new(accounts.taker_stats, false), // taker_stats (mut, non-signer)
         AccountMeta::new_readonly(accounts.authority, true),
         AccountMeta::new_readonly(accounts.drift_program, false),
     ]
@@ -4466,6 +4542,8 @@ pub fn build_remaining_accounts_for_proxy<'a>(
 
 // anchor discriminator for "global:arb_perp"
 const PROXY_ARB_PERP_DISCRIMINATOR: [u8; 8] = [116, 105, 138, 99, 28, 171, 39, 225];
+// anchor discriminator for "global:jit"
+const PROXY_JIT_DISCRIMINATOR: [u8; 8] = [99, 42, 97, 140, 152, 62, 167, 234];
 
 #[cfg(test)]
 mod tests {
