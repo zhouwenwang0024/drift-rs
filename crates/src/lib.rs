@@ -3354,6 +3354,7 @@ impl<'a> TransactionBuilder<'a> {
         market_index: u16,
         taker_stats: &UserStats,
         makers: &[User],
+        maker_stats: &[UserStats],
         revenue_share_authority: Option<Pubkey>,
     ) -> Self {
         // 1) main accounts (match ArbPerp<'info>)
@@ -3371,6 +3372,7 @@ impl<'a> TransactionBuilder<'a> {
             self.account_data.as_ref(),
             taker_stats,
             makers,
+            maker_stats,
             std::iter::empty(),
             std::iter::once(&MarketId::perp(market_index)),
             revenue_share_authority,
@@ -4071,6 +4073,7 @@ impl<'a> TransactionBuilder<'a> {
         edge_ppm: i64,
         taker_stats: &UserStats,
         makers: &[User],
+        maker_stats: &[UserStats],
         proxy_program_id: Option<Pubkey>,
     ) -> Self {
         // 1) main accounts (match Jit<'info>)
@@ -4090,6 +4093,7 @@ impl<'a> TransactionBuilder<'a> {
             self.account_data.as_ref(),
             taker_stats,
             makers,
+            maker_stats,
             std::iter::empty(),
             std::iter::once(&MarketId::perp(market_index)),
             None,
@@ -4444,6 +4448,7 @@ pub fn build_remaining_accounts_for_proxy<'a>(
     taker_account: &User,
     taker_stats: &UserStats,
     makers: &'a [User],
+    maker_stats: &'a [UserStats],
     markets_readable: impl Iterator<Item = &'a MarketId>,
     markets_writable: impl Iterator<Item = &'a MarketId>,
     revenue_share_authority: Option<Pubkey>,
@@ -4527,6 +4532,21 @@ pub fn build_remaining_accounts_for_proxy<'a>(
             Wallet::derive_stats_account(&taker_stats.referrer),
             false,
         ));
+    }
+
+    // include referrers for all makers (needed when makers become takers)
+    let mut seen_referrers = std::collections::HashSet::<Pubkey>::new();
+    for stats in maker_stats {
+        if stats.is_referred() && seen_referrers.insert(stats.referrer) {
+            rem.push(AccountMeta::new(
+                Wallet::derive_user_account(&stats.referrer, 0),
+                false,
+            ));
+            rem.push(AccountMeta::new(
+                Wallet::derive_stats_account(&stats.referrer),
+                false,
+            ));
+        }
     }
 
     // Keep revenue share escrow as the final remaining account (Swift-only behavior).
