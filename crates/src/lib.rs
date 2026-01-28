@@ -4167,6 +4167,25 @@ impl<'a> TransactionBuilder<'a> {
         }
     }
 
+    /// Build a transaction message with extra instructions appended.
+    pub fn build_with_extra_ixs(&self, extra_ixs: &[Instruction]) -> VersionedMessage {
+        let mut ixs = self.ixs.clone();
+        ixs.extend_from_slice(extra_ixs);
+        if self.legacy {
+            let message = Message::new(ixs.as_ref(), Some(&self.authority));
+            VersionedMessage::Legacy(message)
+        } else {
+            let message = v0::Message::try_compile(
+                &self.authority,
+                ixs.as_slice(),
+                self.lookup_tables.as_slice(),
+                Default::default(),
+            )
+            .expect("ok");
+            VersionedMessage::V0(message)
+        }
+    }
+
     pub fn program_data(&self) -> &ProgramData {
         self.program_data
     }
