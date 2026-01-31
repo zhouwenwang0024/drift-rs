@@ -1335,6 +1335,122 @@ impl L3Book {
 
         std::iter::from_fn(next_from)
     }
+
+    /// Get all L3 bids with their computed price used for ordering.
+    pub fn bids_with_price<'b>(
+        &'b self,
+        oracle_price: Option<u64>,
+        perp_market: Option<&'b PerpMarket>,
+        trigger_price: Option<u64>,
+    ) -> impl Iterator<Item = L3OrderWithPrice<'b>> + use<'b> {
+        let mut bids_iter = self.bids.iter().peekable();
+        let mut floating_iter = self.floating_bids.iter().peekable();
+        let mut vamm_iter = self.vamm_bids.iter().peekable();
+        let mut trigger_iter = self.trigger_bids.iter().peekable();
+        let oracle_diff: i64 =
+            (oracle_price.unwrap_or_default() as i64).saturating_sub(self.oracle_price as i64);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let auction_slot = self.slot.saturating_add(1);
+        let oracle_price_for_vamm = oracle_price.unwrap_or(self.oracle_price) as i64;
+
+        if let Some(trig_price) = trigger_price {
+            while let Some(x) = trigger_iter.peek() {
+                if trig_price > x.price && x.is_trigger_above()
+                    || trig_price < x.price && !x.is_trigger_above()
+                {
+                    break;
+                }
+                trigger_iter.next();
+            }
+        }
+
+        enum Src {
+            Fixed,
+            Floating,
+            Vamm,
+            Trigger,
+        }
+
+        let next_from = move || {
+            let a = bids_iter.peek();
+            let f = floating_iter.peek();
+            let t = trigger_iter.peek();
+            let v = vamm_iter.peek();
+
+            let mut best_price = u64::MIN;
+            let mut best_src = None;
+
+            if let Some(x) = a {
+                best_price = x.price;
+                best_src = Some(Src::Fixed);
+            }
+
+            if let Some(x) = f {
+                let price = (x.price as i64 + oracle_diff) as u64;
+                if price > best_price {
+                    best_price = price;
+                    best_src = Some(Src::Floating);
+                }
+            }
+
+            if let Some(market) = perp_market {
+                if let (Some(x), Some(trig_price)) = (t, trigger_price) {
+                    let would_trigger = (x.is_trigger_above() && trig_price > x.price)
+                        || (!x.is_trigger_above() && trig_price < x.price);
+                    if would_trigger {
+                        if let Some(post_trigger_price) =
+                            x.post_trigger_price(auction_slot, oracle_price_for_vamm as u64, market)
+                        {
+                            if post_trigger_price > best_price {
+                                best_price = post_trigger_price;
+                                best_src = Some(Src::Trigger);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(x) = v {
+                    if let Ok(vamm_price) = market.fallback_price(
+                        Direction::Long,
+                        oracle_price_for_vamm,
+                        x.max_ts.saturating_sub(now) as i64,
+                    ) {
+                        if vamm_price > best_price {
+                            best_price = vamm_price;
+                            best_src = Some(Src::Vamm);
+                        }
+                    }
+                }
+            }
+
+            match best_src {
+                Some(Src::Fixed) => bids_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
+                Some(Src::Floating) => floating_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
+                Some(Src::Vamm) => vamm_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
+                Some(Src::Trigger) => trigger_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
+                None => None,
+            }
+        };
+
+        std::iter::from_fn(next_from)
+    }
     /// Get the top N bids
     ///
     /// # Parameters
@@ -1465,6 +1581,122 @@ impl L3Book {
                 Some(Src::Floating) => floating_iter.next(),
                 Some(Src::Trigger) => trigger_iter.next(),
                 Some(Src::Vamm) => vamm_iter.next(),
+                None => None,
+            }
+        };
+
+        std::iter::from_fn(next_from)
+    }
+
+    /// Get all L3 asks with their computed price used for ordering.
+    pub fn asks_with_price<'b>(
+        &'b self,
+        oracle_price: Option<u64>,
+        perp_market: Option<&'b PerpMarket>,
+        trigger_price: Option<u64>,
+    ) -> impl Iterator<Item = L3OrderWithPrice<'b>> + use<'b> {
+        let mut asks_iter = self.asks.iter().peekable();
+        let mut floating_iter = self.floating_asks.iter().peekable();
+        let mut vamm_iter = self.vamm_asks.iter().peekable();
+        let mut trigger_iter = self.trigger_asks.iter().peekable();
+
+        let oracle_diff: i64 =
+            (oracle_price.unwrap_or_default() as i64).saturating_sub(self.oracle_price as i64);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some(trig_price) = trigger_price {
+            while let Some(x) = trigger_iter.peek() {
+                if trig_price > x.price && x.is_trigger_above()
+                    || trig_price < x.price && !x.is_trigger_above()
+                {
+                    break;
+                }
+                trigger_iter.next();
+            }
+        }
+
+        let auction_slot = self.slot.saturating_add(1);
+        let oracle_price_for_vamm = oracle_price.unwrap_or(self.oracle_price) as i64;
+
+        enum Src {
+            Fixed,
+            Floating,
+            Vamm,
+            Trigger,
+        }
+
+        let next_from = move || {
+            let a = asks_iter.peek();
+            let f = floating_iter.peek();
+            let v = vamm_iter.peek();
+            let t = trigger_iter.peek();
+
+            let mut best_price = u64::MAX;
+            let mut best_src = None;
+
+            if let Some(x) = a {
+                best_price = x.price;
+                best_src = Some(Src::Fixed);
+            }
+
+            if let Some(x) = f {
+                let price = (x.price as i64 + oracle_diff) as u64;
+                if price < best_price {
+                    best_price = price;
+                    best_src = Some(Src::Floating);
+                }
+            }
+
+            if let Some(market) = perp_market {
+                if let (Some(x), Some(trig_price)) = (t, trigger_price) {
+                    let would_trigger = (x.is_trigger_above() && trig_price > x.price)
+                        || (!x.is_trigger_above() && trig_price < x.price);
+                    if would_trigger {
+                        if let Some(post_trigger_price) =
+                            x.post_trigger_price(auction_slot, oracle_price_for_vamm as u64, market)
+                        {
+                            if post_trigger_price < best_price {
+                                best_src = Some(Src::Trigger);
+                                best_price = post_trigger_price;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(x) = v {
+                    if let Ok(vamm_price) = market.fallback_price(
+                        Direction::Short,
+                        oracle_price_for_vamm,
+                        x.max_ts.saturating_sub(now) as i64,
+                    ) {
+                        if vamm_price < best_price {
+                            best_price = vamm_price;
+                            best_src = Some(Src::Vamm);
+                        }
+                    }
+                }
+            }
+
+            match best_src {
+                Some(Src::Fixed) => asks_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
+                Some(Src::Floating) => floating_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
+                Some(Src::Trigger) => trigger_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
+                Some(Src::Vamm) => vamm_iter.next().map(|order| L3OrderWithPrice {
+                    order,
+                    price: best_price,
+                }),
                 None => None,
             }
         };

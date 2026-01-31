@@ -727,6 +727,13 @@ pub struct L3Order {
     pub(crate) flags: u8,
 }
 
+#[derive(Debug, Clone)]
+pub struct L3OrderWithPrice<'a> {
+    pub order: &'a L3Order,
+    /// Computed price used for ordering (trigger/floating/vamm resolved).
+    pub price: u64,
+}
+
 impl L3Order {
     /// when set indicates order is reduce only
     pub(crate) const RO_FLAG: u8 = 0b0000_0001;
