@@ -41,6 +41,7 @@ use constants::{
     TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
 };
 pub use drift_pubsub_client::PubsubClient;
+pub use pubsub_pool::PubsubPool;
 use futures_util::TryFutureExt;
 use log::debug;
 use pythnet_sdk::wire::v1::{AccumulatorUpdateData, Proof};
@@ -98,6 +99,7 @@ pub mod jit_client;
 pub mod account_map;
 pub mod marketmap;
 pub mod oraclemap;
+pub mod pubsub_pool;
 
 pub mod slot_subscriber;
 pub mod usermap;
@@ -455,6 +457,11 @@ impl DriftClient {
     /// Return a handle to the inner Ws client
     pub fn ws(&self) -> Arc<PubsubClient> {
         self.backend.ws()
+    }
+
+    /// Return a handle to the PubSub pool (multi-WS)
+    pub fn ws_pool(&self) -> Arc<PubsubPool> {
+        self.backend.ws_pool()
     }
 
     /// Return on-chain program metadata
@@ -1087,6 +1094,7 @@ impl DriftClient {
 pub struct DriftClientBackend {
     rpc_client: Arc<RpcClient>,
     pubsub_client: Arc<PubsubClient>,
+    pubsub_pool: Arc<PubsubPool>,
     program_data: ProgramData,
     blockhash_subscriber: BlockhashSubscriber,
     account_map: AccountMap,
@@ -1098,15 +1106,52 @@ pub struct DriftClientBackend {
 impl DriftClientBackend {
     /// Initialize a new `DriftClientBackend`
     async fn new(context: Context, rpc_client: Arc<RpcClient>) -> SdkResult<Self> {
-        let pubsub_client =
-            Arc::new(PubsubClient::new(&get_ws_url(rpc_client.url().as_str())?).await?);
+        let ws_url = get_ws_url(rpc_client.url().as_str())?;
+        let lut_pubkeys = context.luts();
+
+        let (perp_sync, spot_sync, lut_accounts, state_account_data) = tokio::try_join!(
+            marketmap::get_market_accounts_with_fallback::<PerpMarket>(&rpc_client),
+            marketmap::get_market_accounts_with_fallback::<SpotMarket>(&rpc_client),
+            rpc_client
+                .get_multiple_accounts(lut_pubkeys)
+                .map_err(Into::into),
+            rpc_client
+                .get_account_data(state_account())
+                .map_err(Into::into),
+        )?;
+        let (perp_markets, perp_slot) = perp_sync;
+        let (spot_markets, spot_slot) = spot_sync;
+
+        let mut all_oracles = Vec::<(MarketId, Pubkey, OracleSource)>::with_capacity(
+            perp_markets.len() + spot_markets.len(),
+        );
+        let mut unique_oracles = BTreeSet::<Pubkey>::default();
+        for market in perp_markets.iter() {
+            let info = market.oracle_info();
+            unique_oracles.insert(info.1);
+            all_oracles.push(info);
+        }
+        for market in spot_markets.iter() {
+            let info = market.oracle_info();
+            unique_oracles.insert(info.1);
+            all_oracles.push(info);
+        }
+        let max_subs_per_ws = std::env::var("DRIFT_WS_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(30)
+            .max(1);
+        let total_subs = perp_markets.len() + spot_markets.len() + unique_oracles.len();
+        let pool_size = ((total_subs + max_subs_per_ws - 1) / max_subs_per_ws).max(1);
+        let pubsub_pool = Arc::new(PubsubPool::new(&ws_url, pool_size).await?);
+        let pubsub_client = pubsub_pool.any();
 
         let perp_market_map =
-            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_pool), rpc_client.commitment());
         let spot_market_map =
-            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
-
-        let lut_pubkeys = context.luts();
+            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_pool), rpc_client.commitment());
+        perp_market_map.load_from_accounts(perp_markets, perp_slot);
+        spot_market_map.load_from_accounts(spot_markets, spot_slot);
 
         let account_map = AccountMap::new(
             Arc::clone(&pubsub_client),
@@ -1122,17 +1167,6 @@ impl DriftClientBackend {
             )
         )?;
 
-        let (_, _, lut_accounts, state_account_data) = tokio::try_join!(
-            perp_market_map.sync(&rpc_client),
-            spot_market_map.sync(&rpc_client),
-            rpc_client
-                .get_multiple_accounts(lut_pubkeys)
-                .map_err(Into::into),
-            rpc_client
-                .get_account_data(state_account())
-                .map_err(Into::into),
-        )?;
-
         let lookup_tables = lut_pubkeys
             .iter()
             .zip(lut_accounts.iter())
@@ -1144,19 +1178,8 @@ impl DriftClientBackend {
             })
             .collect::<SdkResult<Vec<_>>>()?;
 
-        let mut all_oracles = Vec::<(MarketId, Pubkey, OracleSource)>::with_capacity(
-            perp_market_map.len() + spot_market_map.len(),
-        );
-        for market_oracle_info in perp_market_map
-            .oracles()
-            .iter()
-            .chain(spot_market_map.oracles().iter())
-        {
-            all_oracles.push(*market_oracle_info);
-        }
-
         let oracle_map = OracleMap::new(
-            Arc::clone(&pubsub_client),
+            Arc::clone(&pubsub_pool),
             all_oracles.as_slice(),
             rpc_client.commitment(),
         );
@@ -1164,6 +1187,7 @@ impl DriftClientBackend {
         Ok(Self {
             rpc_client: Arc::clone(&rpc_client),
             pubsub_client,
+            pubsub_pool,
             blockhash_subscriber: BlockhashSubscriber::new(Duration::from_secs(2), rpc_client),
             program_data: ProgramData::new(
                 spot_market_map.values(),
@@ -1186,15 +1210,51 @@ impl DriftClientBackend {
     ) -> SdkResult<Self> {
         use std::time::Duration;
 
-        // Initialize PubsubClient with explicit URL
-        let pubsub_client = Arc::new(PubsubClient::new(ws_pubsub_url).await?);
+        let lut_pubkeys = context.luts();
+
+        let (perp_sync, spot_sync, lut_accounts, state_account_data) = tokio::try_join!(
+            marketmap::get_market_accounts_with_fallback::<PerpMarket>(&rpc_client),
+            marketmap::get_market_accounts_with_fallback::<SpotMarket>(&rpc_client),
+            rpc_client
+                .get_multiple_accounts(lut_pubkeys)
+                .map_err(Into::into),
+            rpc_client
+                .get_account_data(state_account())
+                .map_err(Into::into),
+        )?;
+        let (perp_markets, perp_slot) = perp_sync;
+        let (spot_markets, spot_slot) = spot_sync;
+
+        let mut all_oracles = Vec::<(MarketId, Pubkey, OracleSource)>::with_capacity(
+            perp_markets.len() + spot_markets.len(),
+        );
+        let mut unique_oracles = BTreeSet::<Pubkey>::default();
+        for market in perp_markets.iter() {
+            let info = market.oracle_info();
+            unique_oracles.insert(info.1);
+            all_oracles.push(info);
+        }
+        for market in spot_markets.iter() {
+            let info = market.oracle_info();
+            unique_oracles.insert(info.1);
+            all_oracles.push(info);
+        }
+        let max_subs_per_ws = std::env::var("DRIFT_WS_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(30)
+            .max(1);
+        let total_subs = perp_markets.len() + spot_markets.len() + unique_oracles.len();
+        let pool_size = ((total_subs + max_subs_per_ws - 1) / max_subs_per_ws).max(1);
+        let pubsub_pool = Arc::new(PubsubPool::new(ws_pubsub_url, pool_size).await?);
+        let pubsub_client = pubsub_pool.any();
 
         let perp_market_map =
-            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_pool), rpc_client.commitment());
         let spot_market_map =
-            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
-
-        let lut_pubkeys = context.luts();
+            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_pool), rpc_client.commitment());
+        perp_market_map.load_from_accounts(perp_markets, perp_slot);
+        spot_market_map.load_from_accounts(spot_markets, spot_slot);
 
         let account_map = AccountMap::new(
             Arc::clone(&pubsub_client),
@@ -1210,17 +1270,6 @@ impl DriftClientBackend {
             )
         )?;
 
-        let (_, _, lut_accounts, state_account_data) = tokio::try_join!(
-            perp_market_map.sync(&rpc_client),
-            spot_market_map.sync(&rpc_client),
-            rpc_client
-                .get_multiple_accounts(lut_pubkeys)
-                .map_err(Into::into),
-            rpc_client
-                .get_account_data(state_account())
-                .map_err(Into::into),
-        )?;
-
         let lookup_tables = lut_pubkeys
             .iter()
             .zip(lut_accounts.iter())
@@ -1230,19 +1279,8 @@ impl DriftClientBackend {
             })
             .collect();
 
-        let mut all_oracles = Vec::<(MarketId, Pubkey, OracleSource)>::with_capacity(
-            perp_market_map.len() + spot_market_map.len(),
-        );
-        for market_oracle_info in perp_market_map
-            .oracles()
-            .iter()
-            .chain(spot_market_map.oracles().iter())
-        {
-            all_oracles.push(*market_oracle_info);
-        }
-
         let oracle_map = OracleMap::new(
-            Arc::clone(&pubsub_client),
+            Arc::clone(&pubsub_pool),
             all_oracles.as_slice(),
             rpc_client.commitment(),
         );
@@ -1250,6 +1288,7 @@ impl DriftClientBackend {
         Ok(Self {
             rpc_client: Arc::clone(&rpc_client),
             pubsub_client,
+            pubsub_pool,
             blockhash_subscriber: BlockhashSubscriber::new(Duration::from_secs(2), rpc_client),
             program_data: ProgramData::new(
                 spot_market_map.values(),
@@ -1572,6 +1611,10 @@ impl DriftClientBackend {
         Arc::clone(&self.pubsub_client)
     }
 
+    fn ws_pool(&self) -> Arc<PubsubPool> {
+        Arc::clone(&self.pubsub_pool)
+    }
+
     /// Get recent tx priority fees
     ///
     /// * `writable_markets` - markets to consider for write locks
@@ -1671,11 +1714,13 @@ impl DriftClientBackend {
     pub async fn get_latest_blockhash(&self) -> SdkResult<Hash> {
         match self.blockhash_subscriber.get_latest_blockhash() {
             Some(hash) => Ok(hash),
-            None => self
-                .rpc_client
-                .get_latest_blockhash()
-                .await
-                .map_err(|err| SdkError::Rpc(Box::new(err))),
+            None => {
+                log::warn!(target: "rpc", "blockhash cache missing; fallback to RPC");
+                self.rpc_client
+                    .get_latest_blockhash()
+                    .await
+                    .map_err(|err| SdkError::Rpc(Box::new(err)))
+            }
         }
     }
 
@@ -4616,19 +4661,21 @@ mod tests {
                 .await
                 .expect("ws connects"),
         );
+        let pubsub_pool = Arc::new(PubsubPool::single(Arc::clone(&pubsub_client)));
 
         let perp_market_map =
-            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<PerpMarket>::new(Arc::clone(&pubsub_pool), rpc_client.commitment());
         let spot_market_map =
-            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_client), rpc_client.commitment());
+            MarketMap::<SpotMarket>::new(Arc::clone(&pubsub_pool), rpc_client.commitment());
 
         let backend = DriftClientBackend {
             rpc_client: Arc::clone(&rpc_client),
             pubsub_client: Arc::clone(&pubsub_client),
+            pubsub_pool: Arc::clone(&pubsub_pool),
             program_data: ProgramData::uninitialized(),
             perp_market_map,
             spot_market_map,
-            oracle_map: OracleMap::new(Arc::clone(&pubsub_client), &[], rpc_client.commitment()),
+            oracle_map: OracleMap::new(Arc::clone(&pubsub_pool), &[], rpc_client.commitment()),
             blockhash_subscriber: BlockhashSubscriber::new(
                 Duration::from_secs(2),
                 Arc::clone(&rpc_client),

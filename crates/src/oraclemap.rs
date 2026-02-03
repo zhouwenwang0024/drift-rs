@@ -61,7 +61,7 @@ pub struct OracleMap {
     shared_oracles: ReadOnlyView<Pubkey, OracleShareMode, ahash::RandomState>,
     latest_slot: Arc<AtomicU64>,
     commitment: CommitmentConfig,
-    pubsub: Arc<PubsubClient>,
+    pubsub_pool: Arc<crate::PubsubPool>,
 }
 
 impl OracleMap {
@@ -70,11 +70,11 @@ impl OracleMap {
     /// Create a new `OracleMap`
     ///
     /// * `rpc_client` - Shared RPC client instance
-    /// * `pubsub_client` - Shared Pubsub client instance
+    /// * `pubsub_pool` - Shared Pubsub pool instance
     /// * `all_oracles` - Exhaustive list of all Drift oracle pubkeys and source by market
     ///
     pub fn new(
-        pubsub_client: Arc<PubsubClient>,
+        pubsub_pool: Arc<crate::PubsubPool>,
         all_oracles: &[(MarketId, Pubkey, OracleSource)],
         commitment: CommitmentConfig,
     ) -> Self {
@@ -117,7 +117,7 @@ impl OracleMap {
             subscriptions: Default::default(),
             latest_slot: Arc::new(AtomicU64::new(0)),
             commitment,
-            pubsub: pubsub_client,
+            pubsub_pool,
         }
     }
 
@@ -171,11 +171,9 @@ impl OracleMap {
                 continue;
             }
 
-            let oracle_subscriber = WebsocketAccountSubscriber::new(
-                Arc::clone(&self.pubsub),
-                *oracle_pubkey,
-                self.commitment,
-            );
+            let pubsub = self.pubsub_pool.pick_by_pubkey(oracle_pubkey);
+            let oracle_subscriber =
+                WebsocketAccountSubscriber::new(pubsub, *oracle_pubkey, self.commitment);
 
             pending_subscriptions.push(oracle_subscriber);
         }
@@ -616,7 +614,8 @@ mod tests {
                 .await
                 .expect("ws connects"),
         );
-        let map = OracleMap::new(pubsub, &all_oracles, rpc.commitment());
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let map = OracleMap::new(pool, &all_oracles, rpc.commitment());
 
         // - dups ignored
         // - markets with same oracle pubkey, make at most 1 sub
@@ -655,7 +654,8 @@ mod tests {
                 .await
                 .expect("ws connects"),
         );
-        let map = OracleMap::new(pubsub, &all_oracles, CommitmentConfig::confirmed());
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let map = OracleMap::new(pool, &all_oracles, CommitmentConfig::confirmed());
 
         let markets = [MarketId::perp(0), MarketId::spot(32), MarketId::perp(4)];
         map.subscribe(&markets).await.expect("subd");
@@ -686,7 +686,8 @@ mod tests {
                 .await
                 .expect("ws connects"),
         );
-        let map = OracleMap::new(pubsub, &all_oracles, CommitmentConfig::confirmed());
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let map = OracleMap::new(pool, &all_oracles, CommitmentConfig::confirmed());
 
         // - dups ignored
         // - markets with same oracle pubkey, make at most 1 sub
@@ -724,15 +725,13 @@ mod tests {
                 OracleSource::PythPull,
             ),
         ];
-        let map = OracleMap::new(
-            Arc::new(
-                PubsubClient::new(&get_ws_url(&devnet_endpoint()).unwrap())
-                    .await
-                    .expect("ws connects"),
-            ),
-            &all_oracles,
-            CommitmentConfig::confirmed(),
+        let pubsub = Arc::new(
+            PubsubClient::new(&get_ws_url(&devnet_endpoint()).unwrap())
+                .await
+                .expect("ws connects"),
         );
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let map = OracleMap::new(pool, &all_oracles, CommitmentConfig::confirmed());
         map.subscribe(&[MarketId::spot(0), MarketId::perp(1)])
             .await
             .expect("subd");
@@ -746,13 +745,19 @@ mod tests {
         use crate::{
             drift_idl::accounts::{PerpMarket, SpotMarket},
             marketmap::MarketMap,
+            utils::get_ws_url,
         };
+        use drift_pubsub_client::PubsubClient;
         let commitment = CommitmentConfig::processed();
 
-        let spot_market_map =
-            MarketMap::<SpotMarket>::new(commitment.clone(), mainnet_endpoint(), true);
-        let perp_market_map =
-            MarketMap::<PerpMarket>::new(commitment.clone(), mainnet_endpoint(), true);
+        let pubsub = Arc::new(
+            PubsubClient::new(&get_ws_url(&mainnet_endpoint()).unwrap())
+                .await
+                .expect("ws connects"),
+        );
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let spot_market_map = MarketMap::<SpotMarket>::new(Arc::clone(&pool), commitment.clone());
+        let perp_market_map = MarketMap::<PerpMarket>::new(Arc::clone(&pool), commitment.clone());
 
         let _ = spot_market_map.sync().await;
         let _ = perp_market_map.sync().await;
@@ -774,13 +779,7 @@ mod tests {
         let oracle_infos_len = oracle_infos.len();
         dbg!(oracle_infos_len);
 
-        let oracle_map = OracleMap::new(
-            commitment,
-            &mainnet_endpoint(),
-            true,
-            perp_oracles,
-            spot_oracles,
-        );
+        let oracle_map = OracleMap::new(Arc::clone(&pool), &oracle_infos, commitment);
 
         let _ = oracle_map.subscribe().await;
 

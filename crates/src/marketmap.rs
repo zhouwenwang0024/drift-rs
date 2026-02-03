@@ -82,7 +82,7 @@ pub struct MarketMap<T: AnchorDeserialize + Send> {
     pub marketmap: Arc<DashMap<u16, DataAndSlot<T>, ahash::RandomState>>,
     subscriptions: DashMap<u16, UnsubHandle, ahash::RandomState>,
     latest_slot: Arc<AtomicU64>,
-    pubsub: Arc<PubsubClient>,
+    pubsub_pool: Arc<crate::PubsubPool>,
     commitment: CommitmentConfig,
 }
 
@@ -92,12 +92,12 @@ where
 {
     pub const SUBSCRIPTION_ID: &'static str = "marketmap";
 
-    pub fn new(pubsub: Arc<PubsubClient>, commitment: CommitmentConfig) -> Self {
+    pub fn new(pubsub_pool: Arc<crate::PubsubPool>, commitment: CommitmentConfig) -> Self {
         Self {
             subscriptions: Default::default(),
             marketmap: Arc::default(),
             latest_slot: Arc::new(AtomicU64::new(0)),
-            pubsub,
+            pubsub_pool,
             commitment,
         }
     }
@@ -159,8 +159,9 @@ where
                 MarketType::Perp => derive_perp_market_account(market.index()),
                 MarketType::Spot => derive_spot_market_account(market.index()),
             };
+            let pubsub = self.pubsub_pool.pick_by_market_id(&market);
             let market_subscriber = WebsocketAccountSubscriber::new(
-                Arc::clone(&self.pubsub),
+                pubsub,
                 market_pubkey,
                 self.commitment,
             );
@@ -283,6 +284,22 @@ where
             self.marketmap.len()
         );
         Ok(())
+    }
+
+    pub(crate) fn load_from_accounts(&self, markets: Vec<T>, latest_slot: Slot) {
+        for market in markets {
+            self.marketmap.insert(
+                market.market_index(),
+                DataAndSlot {
+                    data: market,
+                    slot: latest_slot,
+                },
+            );
+        }
+        let prev_slot = self.latest_slot.load(Ordering::Relaxed);
+        if latest_slot > prev_slot {
+            self.latest_slot.store(latest_slot, Ordering::Relaxed);
+        }
     }
 
     pub fn get_latest_slot(&self) -> u64 {
@@ -437,14 +454,13 @@ mod tests {
 
     #[tokio::test]
     async fn marketmap_subscribe() {
-        let map = MarketMap::<PerpMarket>::new(
-            Arc::new(
-                PubsubClient::new(&get_ws_url(&devnet_endpoint()).unwrap())
-                    .await
-                    .expect("ws connects"),
-            ),
-            CommitmentConfig::confirmed(),
+        let pubsub = Arc::new(
+            PubsubClient::new(&get_ws_url(&devnet_endpoint()).unwrap())
+                .await
+                .expect("ws connects"),
         );
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let map = MarketMap::<PerpMarket>::new(pool, CommitmentConfig::confirmed());
 
         assert!(map
             .subscribe(&[MarketId::perp(0), MarketId::perp(1), MarketId::perp(1)])
@@ -481,7 +497,7 @@ mod rpc_tests {
     use solana_sdk::commitment_config::CommitmentConfig;
 
     use super::*;
-    use crate::utils::test_envs::mainnet_endpoint;
+    use crate::utils::{get_ws_url, test_envs::mainnet_endpoint};
 
     #[tokio::test]
     async fn test_marketmap_perp() {
@@ -489,7 +505,13 @@ mod rpc_tests {
             commitment: CommitmentConfig::Processed,
         };
 
-        let marketmap = MarketMap::<PerpMarket>::new(commitment, mainnet_endpoint(), true);
+        let pubsub = Arc::new(
+            PubsubClient::new(&get_ws_url(&mainnet_endpoint()).unwrap())
+                .await
+                .expect("ws connects"),
+        );
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let marketmap = MarketMap::<PerpMarket>::new(pool, commitment);
         marketmap.subscribe().await.unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
@@ -513,7 +535,13 @@ mod rpc_tests {
             commitment: CommitmentConfig::Processed,
         };
 
-        let marketmap = MarketMap::<SpotMarket>::new(commitment, RPC, true);
+        let pubsub = Arc::new(
+            PubsubClient::new(&get_ws_url(&RPC).unwrap())
+                .await
+                .expect("ws connects"),
+        );
+        let pool = Arc::new(crate::PubsubPool::single(pubsub));
+        let marketmap = MarketMap::<SpotMarket>::new(pool, commitment);
         marketmap.subscribe().await.unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
