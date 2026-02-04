@@ -5,7 +5,6 @@ use std::sync::{
 
 use ahash::HashSet;
 use dashmap::{DashMap, ReadOnlyView};
-use drift_pubsub_client::PubsubClient;
 use futures_util::{
     stream::{FuturesOrdered, FuturesUnordered},
     StreamExt,
@@ -584,6 +583,7 @@ async fn get_multi_account_data_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use drift_pubsub_client::PubsubClient;
     use crate::utils::{
         get_ws_url,
         test_envs::{devnet_endpoint, mainnet_endpoint},

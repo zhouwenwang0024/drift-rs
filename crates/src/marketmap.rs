@@ -8,6 +8,7 @@ use std::{
 
 use anchor_lang::{AccountDeserialize, AnchorDeserialize};
 use dashmap::DashMap;
+#[allow(unused_imports)]
 use drift_pubsub_client::PubsubClient;
 use futures_util::{
     stream::{FuturesOrdered, FuturesUnordered},

@@ -23,7 +23,7 @@ use crate::{
     ffi::OraclePriceData,
     grpc::grpc_subscriber::{AccountFilter, DriftGrpcClient, GeyserSubscribeOpts},
     jupiter::JupiterSwapInfo,
-    marketmap::MarketMap,
+    marketmap::{Market, MarketMap},
     oraclemap::{Oracle, OracleMap},
     swift_order_subscriber::{SignedOrderInfo, SwiftOrderStream},
     types::{
